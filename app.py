@@ -22,6 +22,8 @@ from audit import (
     log_classification,
     now_iso,
 )
+from llm_signal import analyze_llm
+from scoring import combine_signals
 from stylometry import analyze_stylometry
 
 app = Flask(__name__)
@@ -35,19 +37,6 @@ limiter = Limiter(get_remote_address, app=app, default_limits=[])
 MIN_TEXT_CHARS = 40
 
 init_db()
-
-
-def _placeholder_verdict(ai_score):
-    """Single-signal placeholder attribution (refined by the M4 confidence scorer).
-
-    Uses the human-biased bands from planning.md: it takes a strong signal to call
-    something AI, and the middle is 'uncertain'.
-    """
-    if ai_score >= 0.65:
-        return "likely_ai"
-    if ai_score <= 0.35:
-        return "likely_human"
-    return "uncertain"
 
 
 @app.get("/health")
@@ -77,32 +66,38 @@ def submit():
     content_id = str(uuid.uuid4())
     timestamp = now_iso()
 
-    # --- Signal 1 (implemented): stylometry ---
-    stylo = analyze_stylometry(text)
-    stylo_score = stylo["ai_score"]
+    # --- Multi-signal detection pipeline ---
+    stylo = analyze_stylometry(text)        # structural signal (pure Python)
+    llm = analyze_llm(text)                  # semantic signal (Groq)
+    scored = combine_signals(llm, stylo)     # agreement-aware confidence scorer
 
-    attribution = _placeholder_verdict(stylo_score)
-    # Placeholder confidence: distance of the single signal from the fence. The real,
-    # agreement-aware confidence scorer replaces this in Milestone 4.
-    confidence = round(abs(stylo_score - 0.5) * 2, 3)
-
-    # Placeholder label until the label builder is added in Milestone 5.
+    # Placeholder label until the label builder is added in Milestone 5; the variant
+    # key is already chosen by the scorer, so M5 only supplies the wording.
     label = {
-        "variant": "placeholder",
+        "variant": scored["label_variant"],
         "title": "(transparency label added in Milestone 5)",
         "body": "",
     }
 
-    # Persist: content status + structured audit entry.
+    # Persist: content status + structured audit entry capturing BOTH individual signal
+    # scores alongside the combined confidence (required for the multi-signal audit log).
     create_content(content_id, creator_id, "classified", timestamp)
     audit_entry = {
         "content_id": content_id,
         "creator_id": creator_id,
         "timestamp": timestamp,
-        "attribution": attribution,
-        "confidence": confidence,
-        "stylo_score": stylo_score,
-        "signals": {"stylometry": stylo},
+        "attribution": scored["verdict"],
+        "confidence": scored["confidence"],
+        "combined_ai_score": scored["combined_ai_score"],
+        "agreement": scored["agreement"],
+        "signals": {
+            "llm": {"ai_score": llm.get("ai_score"), "available": llm.get("available", False),
+                    "rationale": llm.get("rationale", "")},
+            "stylometry": {"ai_score": stylo["ai_score"], "reliable": stylo["reliable"],
+                           "metrics": stylo["metrics"]},
+        },
+        "weights": scored["weights"],
+        "notes": scored["notes"],
         "status": "classified",
     }
     log_classification(audit_entry)
@@ -111,10 +106,30 @@ def submit():
         {
             "content_id": content_id,
             "creator_id": creator_id,
-            "attribution": {"verdict": attribution, "stylo_ai_score": stylo_score},
-            "confidence": confidence,
+            "attribution": {
+                "verdict": scored["verdict"],
+                "combined_ai_score": scored["combined_ai_score"],
+                "confidence": scored["confidence"],
+            },
+            "confidence": scored["confidence"],
             "label": label,
-            "signals": {"stylometry": stylo},
+            "signals": {
+                "llm": {
+                    "ai_score": llm.get("ai_score"),
+                    "available": llm.get("available", False),
+                    "rationale": llm.get("rationale", ""),
+                },
+                "stylometry": {
+                    "ai_score": stylo["ai_score"],
+                    "reliable": stylo["reliable"],
+                    "metrics": stylo["metrics"],
+                },
+            },
+            "scoring": {
+                "agreement": scored["agreement"],
+                "weights": scored["weights"],
+                "notes": scored["notes"],
+            },
             "status": "classified",
             "timestamp": timestamp,
         }
