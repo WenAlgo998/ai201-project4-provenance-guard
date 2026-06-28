@@ -112,6 +112,21 @@ def log_appeal(entry):
     _append("appeal", entry)
 
 
+def get_classification(content_id):
+    """Return the most recent classification entry for a content_id, or None.
+
+    Used by the appeals workflow so an appeal can be logged with a reference to the
+    original decision it contests.
+    """
+    with _conn() as c:
+        row = c.execute(
+            "SELECT payload FROM audit_log WHERE content_id = ? AND entry_type = "
+            "'classification' ORDER BY id DESC LIMIT 1",
+            (content_id,),
+        ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+
 def get_log(limit=50):
     """Return the most recent audit entries (newest first) as a list of dicts.
 
