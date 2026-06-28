@@ -202,6 +202,15 @@ confidence   = raw_strength * agreement                    # disagreement pulls 
 disagree both drive confidence toward 0 — so `0.51` and `0.95` produce genuinely
 different labels, as required.
 
+**What a confidence of 0.6 means to the system:** confidence is *how sure we are of the
+verdict*, not the probability the text is AI. `confidence = 0.60` is our **decision
+boundary**: it is the minimum certainty required to make a directional call at all.
+Below `0.60` we refuse to commit and always show the `uncertain` label, regardless of
+which side of `0.5` the score leans. So a `0.60` is a *just-barely-confident* result —
+the weakest call we're willing to publish — while `0.95` is a near-certain one. This is
+deliberate: the floor exists so that weak or conflicting evidence never produces an
+accusation.
+
 **Verdict bands (deliberately human-biased):**
 
 | Condition                                                       | Verdict     | Label variant         |
@@ -303,6 +312,34 @@ Liveness check → `{ "status": "ok" }`.
 
 ---
 
+## Appeals workflow
+
+- **Who can appeal:** the creator of a submission — anyone holding the `content_id`
+  returned by `/submit`. (On a real platform this would be gated by the creator's
+  authenticated session; for this project the `content_id` is the handle.) An appeal can
+  be filed against any classification, but it is most meaningful for an `ai` or
+  `uncertain` verdict the creator disputes.
+- **What they provide:** the `content_id` and free-text `creator_reasoning` explaining
+  why they believe the verdict is wrong (e.g., "I wrote this by hand over three weeks;
+  the formal tone is just how I write"). Reasoning is **required** — an empty appeal is
+  rejected with `400`.
+- **What the system does on receipt:**
+    1. Looks up the submission in the content store (`404` if unknown).
+    2. Flips its status from `classified` → **`under_review`**.
+    3. Appends an **appeal entry** to the audit log, carrying the `content_id`, the
+       creator's reasoning, a new `appeal_id`, and a timestamp — recorded **alongside**
+       the original classification entry so the two are visibly linked.
+    4. Returns `{ content_id, appeal_id, status: "under_review", timestamp }`.
+  No automated re-classification occurs; resolution is a human decision.
+- **What a human reviewer sees in the appeal queue:** querying `GET /log` (or a future
+  moderation view) surfaces each appeal next to the decision it contests, so a reviewer
+  sees, in one place: the original verdict and confidence, both individual signal scores
+  (LLM rationale + stylometry metrics), the label text shown to the reader, the creator's
+  reasoning, and timestamps for both events. That is enough context to uphold or overturn
+  the verdict without re-running the pipeline.
+
+---
+
 ## False-positive scenario (traced end to end)
 
 **Scenario:** A non-native English speaker submits a heartfelt but grammatically clean,
@@ -343,21 +380,51 @@ confident _false_ "AI" verdict structurally hard to reach, and provides a fallba
 
 ## AI Tool Plan
 
-AI tools (Claude Code) will be used to **generate implementation code in Milestone 2**.
+AI tools (Claude Code) will generate implementation code across the three build
+milestones. In every case the relevant spec section **plus the `## Architecture`
+diagram** are the input, and I own the design constants (thresholds, weights, label
+wording, rate limits) and the verification.
 
-- **Spec sections provided as input:** the _API surface_ section (endpoint contracts),
-  the _Confidence scoring & uncertainty representation_ section (exact combination
-  formula and threshold table), the _Transparency label variants_ table (verbatim text),
-  and the _Detection signals_ descriptions.
-- **Diagram provided as input:** the submission-flow and appeal-flow ASCII diagrams in
-  the `## Architecture` section, so generated code matches the intended component
-  boundaries and the data passed along each arrow.
-- **What AI will generate:** the Flask app skeleton, the stylometry signal functions, the
-  Groq prompt + parsing, the confidence-scoring function, and the SQLite audit-log layer.
-- **What I will own/verify:** the exact thresholds and weights, the verbatim label text,
-  the rate-limit values and their justification, and validation that different inputs
-  produce meaningfully different confidence scores. AI output that drifts from the spec
-  (e.g., a naive `> 0.5` verdict instead of the human-biased bands) will be overridden.
+### M3 — Submission endpoint + first signal
 
-Subsequent milestones (rate limiting, audit log, README) will follow this same pattern:
-spec section + diagram as input, with thresholds, limits, and label wording owned by me.
+- **Spec sections provided:** `## Detection signals` (Signal 2 stylometry definition),
+  `## API surface` (the `/submit` contract), and the submission-flow diagram from
+  `## Architecture`.
+- **What I'll ask the AI to generate:** the Flask app skeleton, the `POST /submit`
+  endpoint with input validation, and the first signal — the pure-Python stylometry
+  function returning `stylo_ai_score` ∈ `[0,1]` plus its raw metrics (I'll start with
+  stylometry because it's deterministic and needs no API key, making it easy to test).
+- **How I'll verify:** call the stylometry function directly on a handful of inputs
+  (a bursty human paragraph, a uniform AI paragraph, a one-liner) **before** wiring it
+  into the endpoint, confirming the scores move in the expected direction and that short
+  text is handled. Then hit `/submit` with curl and check the JSON shape matches the spec.
+
+### M4 — Second signal + confidence scoring
+
+- **Spec sections provided:** `## Detection signals` (Signal 1 LLM definition),
+  `## Confidence scoring & uncertainty representation` (the exact combination formula,
+  agreement penalty, and verdict-band table), and the submission-flow diagram.
+- **What I'll ask the AI to generate:** the Groq LLM signal (prompt + JSON parsing into
+  `llm_ai_score` + rationale, with graceful fallback if Groq is unavailable) and the
+  confidence-scoring function implementing `combined_ai_score`, `agreement`, and
+  `confidence` exactly as specified.
+- **How I'll verify:** run the validation matrix from the uncertainty section — clearly
+  human text, clearly AI text, a borderline case, and a signals-disagree case — and
+  confirm confidence **varies meaningfully** (high for the clear cases, low for the
+  borderline/disagreement cases) rather than flipping binary at 0.5. I'll override any
+  AI-generated logic that uses a naive `> 0.5` verdict instead of the human-biased bands.
+
+### M5 — Production layer (labels, appeals, rate limiting, audit log)
+
+- **Spec sections provided:** `## Transparency label variants` (verbatim text),
+  `## Appeals workflow`, the `/appeal` and `/log` contracts from `## API surface`, and
+  the appeal-flow diagram.
+- **What I'll ask the AI to generate:** the label-builder mapping
+  `(combined_ai_score, confidence)` → variant/title/body, the `POST /appeal` endpoint
+  (status update + appeal logging), the SQLite audit-log + content-store layer, and the
+  Flask-Limiter configuration.
+- **How I'll verify:** craft inputs that reach **all three** label variants and confirm
+  each renders the exact wording from the spec; submit an appeal and confirm the content's
+  status becomes `under_review` and the appeal appears in `/log` beside the original
+  decision; and trip the rate limit to confirm a `429`. I own the specific rate-limit
+  numbers and their justification (documented in the README), not the AI.
