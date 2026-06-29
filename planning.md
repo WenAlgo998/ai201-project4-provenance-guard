@@ -428,3 +428,54 @@ wording, rate limits) and the verification.
   status becomes `under_review` and the appeal appears in `/log` beside the original
   decision; and trip the rate limit to confirm a `429`. I own the specific rate-limit
   numbers and their justification (documented in the README), not the AI.
+
+---
+
+## Stretch features (planned before building, per the brief)
+
+All four stretch features were implemented. This section is the pre-work plan; the
+README documents what was actually built.
+
+### 1. Ensemble detection (3rd signal + voting)
+
+- **Plan:** add a third, genuinely distinct signal — a **lexical "AI-tell" detector**
+  (pure Python) that measures the *density of formulaic boilerplate phrases* ("it is
+  important to note", "furthermore", "delve into", …). It is distinct from stylometry
+  (structure) and the LLM (meaning): it targets *phrasing*.
+- **Weighting / conflict resolution:** weighted ensemble — LLM 0.50, stylometry 0.30,
+  lexical 0.20 (trust order). Conflicts are resolved by (a) the weighted vote, (b)
+  down-weighting any signal that self-reports unreliable, and (c) a **dispersion penalty**:
+  when the three signals disagree (wide score spread), confidence drops and the verdict
+  falls back to `uncertain`. Individual signal scores are returned alongside the ensemble
+  result.
+- **Edge case:** a signal that flips the majority (e.g., lexical sees no tells in a formal
+  human essay while the others lean AI) should *increase* dispersion → lower confidence,
+  not silently get outvoted. This is desirable: it strengthens the false-positive guard.
+
+### 2. Provenance certificate ("Verified Human")
+
+- **Plan:** a creator earns a certificate via a **two-step challenge–response**: request a
+  one-time pass-phrase (`GET /certify/challenge`), then echo it back with an authorship
+  attestation (`POST /certify`). The certificate attests the *creator*, not the *text*.
+- **Display:** a certified creator's submissions carry a `✅ Verified Human` badge that is
+  **distinct from** the automated detection label and shown *alongside* it, so a verified
+  credential is never confused with an automated estimate.
+- **Edge case:** a challenge is single-use and tied to one creator id; replay or a
+  mismatched phrase is rejected.
+
+### 3. Analytics dashboard
+
+- **Plan:** a `GET /analytics` endpoint (+ a small `/dashboard` HTML view) computing
+  metrics from the audit log: detection pattern (AI/human/uncertain counts + ratio),
+  appeal rate, average confidence, uncertain rate, and verified-creator count.
+
+### 4. Multi-modal support (images)
+
+- **Plan:** `POST /submit` accepts `content_type: "image"` with structured `metadata`
+  and/or a `caption`. The pipeline swaps in image-appropriate signals: a **metadata
+  provenance** check (AI-generator tags, C2PA flags, camera-EXIF presence) as the
+  structural analogue of stylometry, plus the **LLM applied to the caption** as the
+  semantic analogue. Both feed the same ensemble scorer, so confidence and labels work
+  identically across modalities.
+- **Edge case:** an image with neither metadata nor caption is rejected (`400`); a bare
+  "no EXIF" guess is marked low-reliability so it can't drive a confident verdict alone.

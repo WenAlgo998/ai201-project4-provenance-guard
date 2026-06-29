@@ -51,6 +51,26 @@ def build_label(label_variant, confidence):
     }
 
 
+def build_verified_label(certificate):
+    """Verified-Human badge for the Provenance Certificate stretch feature.
+
+    Deliberately distinct from the automated detection labels above: it is a green
+    check-badge that vouches for the *creator* (who completed verification), not an
+    estimate about the *text*. A reader sees it alongside — not instead of — the
+    detection label, so the two sources of trust are never conflated.
+    """
+    return {
+        "variant": "verified_human",
+        "badge": "✅ Verified Human",
+        "body": (
+            "This creator completed Provenance Guard's human-verification step, so their "
+            "authorship is confirmed — this is a verified credential, not an automated "
+            "guess. Issued {issued}.".format(issued=certificate.get("issued_at", ""))
+        ),
+        "certificate_id": certificate.get("certificate_id"),
+    }
+
+
 if __name__ == "__main__":
     import json
 

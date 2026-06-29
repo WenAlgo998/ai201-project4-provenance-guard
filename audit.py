@@ -57,6 +57,69 @@ def init_db():
             )
             """
         )
+        # Provenance Certificate stretch feature.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS challenges (
+                challenge_id TEXT PRIMARY KEY,
+                creator_id   TEXT NOT NULL,
+                phrase       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                used         INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS certificates (
+                creator_id     TEXT PRIMARY KEY,
+                certificate_id TEXT NOT NULL,
+                method         TEXT NOT NULL,
+                issued_at      TEXT NOT NULL
+            )
+            """
+        )
+
+
+def create_challenge(challenge_id, creator_id, phrase, timestamp):
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO challenges (challenge_id, creator_id, phrase, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (challenge_id, creator_id, phrase, timestamp),
+        )
+
+
+def get_challenge(challenge_id):
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM challenges WHERE challenge_id = ?", (challenge_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def mark_challenge_used(challenge_id):
+    with _conn() as c:
+        c.execute("UPDATE challenges SET used = 1 WHERE challenge_id = ?", (challenge_id,))
+
+
+def issue_certificate(creator_id, certificate_id, method, timestamp):
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO certificates (creator_id, certificate_id, method, "
+            "issued_at) VALUES (?, ?, ?, ?)",
+            (creator_id, certificate_id, method, timestamp),
+        )
+
+
+def get_certificate(creator_id):
+    if not creator_id:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM certificates WHERE creator_id = ?", (creator_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def create_content(content_id, creator_id, status, timestamp):
@@ -110,6 +173,10 @@ def log_classification(entry):
 
 def log_appeal(entry):
     _append("appeal", entry)
+
+
+def log_certification(entry):
+    _append("certification", entry)
 
 
 def get_classification(content_id):

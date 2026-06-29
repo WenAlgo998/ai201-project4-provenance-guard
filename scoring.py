@@ -1,54 +1,54 @@
-"""Confidence scorer — combines the two signals into one calibrated result.
+"""Confidence scorer — combines an ensemble of signals into one calibrated result.
 
-Implements the formula and verdict bands from planning.md
-("Confidence scoring & uncertainty representation") exactly:
+Originally a two-signal weighted blend; extended for the Ensemble Detection stretch
+feature to combine an arbitrary number of signals with a documented weighting + voting
+strategy (see "Ensemble strategy" below and the README).
 
-    combined_ai_score = w_llm * llm_ai_score + w_stylo * stylo_ai_score
-    agreement         = 1 - |llm_ai_score - stylo_ai_score|
-    raw_strength      = min(1.0, |combined_ai_score - 0.5| * 2.5)   # see calibration note
-    confidence        = raw_strength * (0.5 + 0.5 * agreement)      # see calibration note
+Ensemble strategy
+-----------------
+Each signal contributes an ``ai_score`` ∈ [0,1] and a trust weight. The default
+text-pipeline weights reflect how much we trust each signal:
 
-Calibration note (divergence from the original planning.md formula, kept deliberately
-so the README spec reflection can document it): the spec defined
-`raw_strength = |combined - 0.5| * 2` and `confidence = raw_strength * agreement`.
-Empirically that compressed the scale badly — the LLM almost never returns extreme
-probabilities, so realistic "clearly human" text only reaches a combined score around
-0.2, and multiplying two sub-1 factors meant even obvious cases couldn't clear the 0.60
-floor. Two adjustments fix this WITHOUT moving the 0.60 decision boundary (so the
-"what 0.6 means" story in planning.md still holds):
-  1. Steepen strength: `min(1.0, |combined - 0.5| * 2.5)` so the confidence scale uses
-     its full range for realistic inputs.
-  2. Soften the agreement penalty: `(0.5 + 0.5 * agreement)` — full agreement leaves
-     confidence untouched, total disagreement halves it (rather than zeroing it).
-The false-positive guard is preserved: the formal-human and academic-AI samples (both
-~0.70 combined) still land below 0.60 -> "uncertain", while genuinely clear, agreeing
-cases on either side now earn a confident label.
+    LLM (semantic)      0.50   — most informative; judges meaning/voice
+    Stylometry (struct) 0.30   — independent structural check
+    Lexical (phrasing)  0.20   — shallow but precise; AI boilerplate tells
 
-Verdict bands (deliberately human-biased — it takes a strong, confident signal to
-call something AI; the middle is always "uncertain"):
+Conflict resolution between signals is handled three ways, in order:
+  1. **Weighting (trust vote).** The combined score is a weighted average, so a
+     higher-trust signal moves the result more. No single signal can dominate: the two
+     pure-Python signals together (0.50) can outvote the LLM (0.50).
+  2. **Reliability down-weighting.** A signal that self-reports low reliability (e.g.
+     stylometry on very short text) has its weight cut to 30% and the weights are
+     renormalized, so a noisy signal doesn't distort the vote.
+  3. **Dispersion penalty (the tie-breaker).** When the signals *disagree* — a wide
+     spread between the highest and lowest score — confidence is reduced. Disagreement
+     therefore pushes the verdict toward "uncertain" rather than forcing a call. This is
+     where genuine conflict is surfaced honestly instead of hidden.
 
-    confidence >= 0.60 and combined >= 0.65  -> likely_ai     (high_confidence_ai)
-    confidence >= 0.60 and combined <= 0.35  -> likely_human  (high_confidence_human)
-    otherwise                                -> uncertain     (uncertain)
+If only one signal is available (e.g. the LLM is down), confidence is capped at 0.50 so
+a lone signal can never produce a confident verdict.
 
-Two adjustments to the base weights (0.65 LLM / 0.35 stylometry):
+Confidence formula (see calibration note for the divergence from the original spec):
 
-* If stylometry is unreliable (very short text), shift weight to the LLM (0.85 / 0.15)
-  so a noisy structural score doesn't dominate.
-* If the LLM signal is unavailable, fall back to stylometry alone with confidence
-  capped at 0.50 — a single structural signal should never produce a high-confidence
-  call. The verdict then can never exceed "uncertain" in practice.
+    combined      = Σ wᵢ·scoreᵢ           (weights renormalized over included signals)
+    agreement     = 1 - (max score - min score)        # dispersion across the ensemble
+    raw_strength  = min(1.0, |combined - 0.5| * 2.5)
+    confidence    = raw_strength * (0.5 + 0.5 * agreement)
+
+Verdict bands (deliberately human-biased): confidence 0.60 is the decision boundary.
+    confidence >= 0.60 and combined >= 0.65 -> likely_ai     (high_confidence_ai)
+    confidence >= 0.60 and combined <= 0.35 -> likely_human  (high_confidence_human)
+    otherwise                               -> uncertain     (uncertain)
 """
 
-# Base weights when both signals are present and stylometry is reliable.
-W_LLM_BASE, W_STYLO_BASE = 0.65, 0.35
-# Weights when stylometry is unreliable (short text): lean on the LLM.
-W_LLM_SHORT, W_STYLO_SHORT = 0.85, 0.15
+# Default trust weights for the text pipeline's three signals.
+DEFAULT_WEIGHTS = {"llm": 0.50, "stylometry": 0.30, "lexical": 0.20}
+UNRELIABLE_WEIGHT_FACTOR = 0.30   # multiply a signal's weight when it self-reports unreliable
 
-CONFIDENCE_FLOOR = 0.60   # minimum certainty to make any directional call
-AI_BAND = 0.65            # combined score at/above this leans AI
-HUMAN_BAND = 0.35         # combined score at/below this leans human
-FALLBACK_CONF_CAP = 0.50  # cap when only stylometry is available
+CONFIDENCE_FLOOR = 0.60
+AI_BAND = 0.65
+HUMAN_BAND = 0.35
+FALLBACK_CONF_CAP = 0.50
 
 
 def _verdict(combined, confidence):
@@ -59,67 +59,69 @@ def _verdict(combined, confidence):
     return "uncertain", "uncertain"
 
 
-def combine_signals(llm, stylo):
-    """Combine the LLM and stylometry signal dicts into a scored result.
+def combine_signals(signals):
+    """Combine an ensemble of signal results.
 
     Args:
-        llm:   {"available": bool, "ai_score": float|None, "rationale": str}
-        stylo: {"ai_score": float, "reliable": bool, "metrics": {...}}
+        signals: list of dicts, each:
+            {"name": str, "ai_score": float|None, "weight": float,
+             "available": bool, "reliable": bool}
 
-    Returns a dict with combined_ai_score, confidence, agreement, verdict, the chosen
-    label variant key, the weights used, and human-readable notes.
+    Returns a scored result dict (combined_ai_score, confidence, agreement, verdict,
+    label_variant, weights actually used, and notes).
     """
-    stylo_score = stylo["ai_score"]
-    stylo_reliable = stylo["reliable"]
-    llm_available = llm.get("available", False)
-    llm_score = llm.get("ai_score")
     notes = []
+    # Keep only available signals with a numeric score.
+    usable = [s for s in signals if s.get("available", True) and s.get("ai_score") is not None]
 
-    if not llm_available:
-        # Fallback: stylometry only, confidence capped so it can't make a strong call.
-        combined = stylo_score
-        raw_strength = abs(combined - 0.5) * 2
-        confidence = round(min(raw_strength, FALLBACK_CONF_CAP), 3)
-        agreement = None
-        weights = {"llm": 0.0, "stylometry": 1.0}
-        notes.append(
-            "LLM signal unavailable; stylometry-only fallback with confidence "
-            f"capped at {FALLBACK_CONF_CAP}."
-        )
-        verdict, variant = _verdict(combined, confidence)
+    if not usable:
+        # No signal produced a score at all — refuse to guess.
         return {
-            "combined_ai_score": round(combined, 3),
-            "confidence": confidence,
-            "agreement": agreement,
-            "verdict": verdict,
-            "label_variant": variant,
-            "weights": weights,
-            "notes": notes,
+            "combined_ai_score": 0.5,
+            "confidence": 0.0,
+            "agreement": None,
+            "verdict": "uncertain",
+            "label_variant": "uncertain",
+            "weights": {},
+            "notes": ["No detection signal was available; cannot classify."],
         }
 
-    # Both signals present.
-    if stylo_reliable:
-        w_llm, w_stylo = W_LLM_BASE, W_STYLO_BASE
+    # Effective weights: down-weight unreliable signals, then renormalize.
+    eff = {}
+    for s in usable:
+        w = s["weight"]
+        if not s.get("reliable", True):
+            w *= UNRELIABLE_WEIGHT_FACTOR
+            notes.append(f"{s['name']} self-reported unreliable; weight reduced.")
+        eff[s["name"]] = w
+    total_w = sum(eff.values()) or 1.0
+    eff = {name: round(w / total_w, 3) for name, w in eff.items()}
+
+    combined = sum(eff[s["name"]] * s["ai_score"] for s in usable)
+
+    scores = [s["ai_score"] for s in usable]
+    if len(scores) >= 2:
+        agreement = 1 - (max(scores) - min(scores))   # dispersion across the ensemble
     else:
-        w_llm, w_stylo = W_LLM_SHORT, W_STYLO_SHORT
-        notes.append("Stylometry unreliable on short text; LLM up-weighted.")
+        agreement = None
 
-    combined = w_llm * llm_score + w_stylo * stylo_score
-    agreement = 1 - abs(llm_score - stylo_score)
-    # Calibrated strength + softened agreement penalty (see module docstring note).
     raw_strength = min(1.0, abs(combined - 0.5) * 2.5)
-    confidence = raw_strength * (0.5 + 0.5 * agreement)
-
-    if agreement < 0.6:
-        notes.append("Signals disagree; confidence reduced and verdict pulled toward uncertain.")
+    if agreement is None:
+        # Single signal: cap confidence so it can't make a strong call.
+        confidence = round(min(raw_strength, FALLBACK_CONF_CAP), 3)
+        notes.append(f"Only one signal available; confidence capped at {FALLBACK_CONF_CAP}.")
+    else:
+        confidence = round(raw_strength * (0.5 + 0.5 * agreement), 3)
+        if agreement < 0.6:
+            notes.append("Signals disagree; confidence reduced, verdict pulled toward uncertain.")
 
     verdict, variant = _verdict(combined, confidence)
     return {
         "combined_ai_score": round(combined, 3),
-        "confidence": round(confidence, 3),
-        "agreement": round(agreement, 3),
+        "confidence": confidence,
+        "agreement": round(agreement, 3) if agreement is not None else None,
         "verdict": verdict,
         "label_variant": variant,
-        "weights": {"llm": w_llm, "stylometry": w_stylo},
+        "weights": eff,
         "notes": notes,
     }

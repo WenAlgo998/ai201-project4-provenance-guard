@@ -11,7 +11,24 @@ Run:  .venv/bin/python calibration_check.py
 
 from llm_signal import analyze_llm
 from scoring import combine_signals
+from signals_lexical import analyze_lexical
 from stylometry import analyze_stylometry
+
+
+def _score(text):
+    """Run the 3-signal text ensemble and return (llm, stylo, lexical, scored)."""
+    stylo = analyze_stylometry(text)
+    llm = analyze_llm(text)
+    lex = analyze_lexical(text)
+    signals = [
+        {"name": "llm", "ai_score": llm.get("ai_score"), "weight": 0.50,
+         "available": llm.get("available", False), "reliable": True},
+        {"name": "stylometry", "ai_score": stylo["ai_score"], "weight": 0.30,
+         "available": True, "reliable": stylo["reliable"]},
+        {"name": "lexical", "ai_score": lex["ai_score"], "weight": 0.20,
+         "available": True, "reliable": True},
+    ]
+    return llm, stylo, lex, combine_signals(signals)
 
 CASES = {
     "clearly_ai": (
@@ -43,18 +60,18 @@ CASES = {
 
 
 def main():
-    header = f"{'case':<26}{'llm':>7}{'stylo':>8}{'comb':>8}{'agree':>8}{'conf':>8}  verdict"
+    header = (f"{'case':<26}{'llm':>7}{'stylo':>8}{'lex':>7}{'comb':>8}"
+              f"{'agree':>8}{'conf':>8}  verdict")
     print(header)
     print("-" * len(header))
     for name, text in CASES.items():
-        stylo = analyze_stylometry(text)
-        llm = analyze_llm(text)
-        scored = combine_signals(llm, stylo)
+        llm, stylo, lex, scored = _score(text)
         llm_s = llm.get("ai_score")
         print(
             f"{name:<26}"
             f"{(llm_s if llm_s is not None else float('nan')):>7.2f}"
             f"{stylo['ai_score']:>8.2f}"
+            f"{lex['ai_score']:>7.2f}"
             f"{scored['combined_ai_score']:>8.2f}"
             f"{(scored['agreement'] if scored['agreement'] is not None else float('nan')):>8.2f}"
             f"{scored['confidence']:>8.2f}"
